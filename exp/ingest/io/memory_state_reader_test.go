@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io/ioutil"
+	"sync"
 	"testing"
 
 	"github.com/stellar/go/support/historyarchive"
@@ -18,9 +19,10 @@ func TestMemoryStateReaderTestSuite(t *testing.T) {
 
 type MemoryStateReaderTestSuite struct {
 	suite.Suite
-	mockArchive *historyarchive.MockArchive
-	reader      *MemoryStateReader
-	has         historyarchive.HistoryArchiveState
+	mockArchive          *historyarchive.MockArchive
+	reader               *MemoryStateReader
+	has                  historyarchive.HistoryArchiveState
+	mockBucketExistsCall *mock.Call
 }
 
 func (s *MemoryStateReaderTestSuite) SetupTest() {
@@ -34,7 +36,7 @@ func (s *MemoryStateReaderTestSuite) SetupTest() {
 		Return(s.has, nil)
 
 	// BucketExists should be called 21 times (11 levels, last without `snap`)
-	s.mockArchive.
+	s.mockBucketExistsCall = s.mockArchive.
 		On("BucketExists", mock.AnythingOfType("historyarchive.Hash")).
 		Return(true).Times(21)
 
@@ -51,21 +53,11 @@ func (s *MemoryStateReaderTestSuite) TearDownTest() {
 // TestSimple test reading buckets with a single live entry.
 func (s *MemoryStateReaderTestSuite) TestSimple() {
 	curr1 := createXdrStream(
-		xdr.BucketEntry{
-			Type: xdr.BucketEntryTypeLiveentry,
-			LiveEntry: &xdr.LedgerEntry{
-				LastModifiedLedgerSeq: 1,
-				Data: xdr.LedgerEntryData{
-					Type: xdr.LedgerEntryTypeAccount,
-					Account: &xdr.AccountEntry{
-						AccountId: xdr.MustAddress("GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML"),
-					},
-				},
-			},
-		},
+		metaEntry(11),
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
 	)
 
-	nextBucket := s.getNextBucket()
+	nextBucket := s.getNextBucketChannel()
 
 	// Return curr1 stream for the first bucket...
 	s.mockArchive.
@@ -88,37 +80,20 @@ func (s *MemoryStateReaderTestSuite) TestSimple() {
 	s.Assert().Equal("GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", id.Address())
 
 	_, err = s.reader.Read()
-	s.Require().Error(err, EOF)
+	s.Require().Equal(err, EOF)
 }
 
 // TestRemoved test reading buckets with a single live entry that was removed.
 func (s *MemoryStateReaderTestSuite) TestRemoved() {
 	curr1 := createXdrStream(
-		xdr.BucketEntry{
-			Type: xdr.BucketEntryTypeDeadentry,
-			DeadEntry: &xdr.LedgerKey{
-				Type:    xdr.LedgerEntryTypeAccount,
-				Account: &xdr.LedgerKeyAccount{xdr.MustAddress("GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML")},
-			},
-		},
+		entryAccount(xdr.BucketEntryTypeDeadentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
 	)
 
 	snap1 := createXdrStream(
-		xdr.BucketEntry{
-			Type: xdr.BucketEntryTypeLiveentry,
-			LiveEntry: &xdr.LedgerEntry{
-				LastModifiedLedgerSeq: 1,
-				Data: xdr.LedgerEntryData{
-					Type: xdr.LedgerEntryTypeAccount,
-					Account: &xdr.AccountEntry{
-						AccountId: xdr.MustAddress("GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML"),
-					},
-				},
-			},
-		},
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
 	)
 
-	nextBucket := s.getNextBucket()
+	nextBucket := s.getNextBucketChannel()
 
 	// Return curr1 and snap1 stream for the first two bucket...
 	s.mockArchive.
@@ -137,7 +112,175 @@ func (s *MemoryStateReaderTestSuite) TestRemoved() {
 	}
 
 	_, err := s.reader.Read()
-	s.Require().Error(err, EOF)
+	s.Require().Equal(err, EOF)
+}
+
+// TestConcurrentRead test concurrent reads for race conditions
+func (s *MemoryStateReaderTestSuite) TestConcurrentRead() {
+	curr1 := createXdrStream(
+		entryAccount(xdr.BucketEntryTypeDeadentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
+	)
+
+	snap1 := createXdrStream(
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GCMNSW2UZMSH3ZFRLWP6TW2TG4UX4HLSYO5HNIKUSFMLN2KFSF26JKWF", 1),
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GB6IPC7LIOSRY26MXHQ3QJ32MTELYAA6YFIRBXZVVGTU7AOI4KUFOQ54", 1),
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GCK45YKCFNIOICB4TWPCOPWLQYNUKCJVV7OMMHH55AB3DD67K4E54STO", 1),
+	)
+
+	nextBucket := s.getNextBucketChannel()
+
+	// Return curr1 and snap1 stream for the first two bucket...
+	s.mockArchive.
+		On("GetXdrStreamForHash", <-nextBucket).
+		Return(curr1, nil).Once()
+
+	s.mockArchive.
+		On("GetXdrStreamForHash", <-nextBucket).
+		Return(snap1, nil).Once()
+
+	// ...and empty streams for the rest of the buckets.
+	for hash := range nextBucket {
+		s.mockArchive.
+			On("GetXdrStreamForHash", hash).
+			Return(createXdrStream(), nil).Once()
+	}
+
+	// 3 live entries
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			_, err := s.reader.Read()
+			s.Assert().Nil(err)
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+
+	// Next call should return EOF
+	_, err := s.reader.Read()
+	s.Require().Equal(err, EOF)
+}
+
+// TestEnsureLatestLiveEntry tests if a live entry overrides an older initentry
+func (s *MemoryStateReaderTestSuite) TestEnsureLatestLiveEntry() {
+	curr1 := createXdrStream(
+		metaEntry(11),
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
+		entryAccount(xdr.BucketEntryTypeInitentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 2),
+	)
+
+	nextBucket := s.getNextBucketChannel()
+
+	// Return curr1 stream, rest won't be read due to an error
+	s.mockArchive.
+		On("GetXdrStreamForHash", <-nextBucket).
+		Return(curr1, nil).Once()
+
+	// ...and empty streams for the rest of the buckets.
+	for hash := range nextBucket {
+		s.mockArchive.
+			On("GetXdrStreamForHash", hash).
+			Return(createXdrStream(), nil).Once()
+	}
+
+	entry, err := s.reader.Read()
+	s.Require().Nil(err)
+	// Latest entry balance is 1
+	s.Assert().Equal(xdr.Int64(1), entry.Data.Account.Balance)
+
+	_, err = s.reader.Read()
+	s.Require().Equal(err, EOF)
+}
+
+// TestMalformedProtocol11Bucket tests a buggy protocol 11 bucket (meta not the first entry)
+func (s *MemoryStateReaderTestSuite) TestMalformedProtocol11Bucket() {
+	curr1 := createXdrStream(
+		entryAccount(xdr.BucketEntryTypeLiveentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
+		metaEntry(11),
+	)
+
+	nextBucket := s.getNextBucketChannel()
+
+	// Return curr1 stream, rest won't be read due to an error
+	s.mockArchive.
+		On("GetXdrStreamForHash", <-nextBucket).
+		Return(curr1, nil).Once()
+
+	// BucketExists will be called only once in this test due to an error
+	s.mockBucketExistsCall.Once()
+
+	// Account entry
+	_, err := s.reader.Read()
+	s.Require().Nil(err)
+
+	// Meta entry
+	_, err = s.reader.Read()
+	s.Require().NotNil(err)
+	s.Assert().Equal("Error while reading from buckets: METAENTRY not the first entry (n=1) in the bucket hash '517bea4c6627a688a8ce501febd8c562e737e3d86b29689d9956217640f3c74b'", err.Error())
+}
+
+// TestMalformedProtocol11BucketNoMeta tests a buggy protocol 11 bucket (no meta entry)
+func (s *MemoryStateReaderTestSuite) TestMalformedProtocol11BucketNoMeta() {
+	curr1 := createXdrStream(
+		entryAccount(xdr.BucketEntryTypeInitentry, "GC3C4AKRBQLHOJ45U4XG35ESVWRDECWO5XLDGYADO6DPR3L7KIDVUMML", 1),
+	)
+
+	nextBucket := s.getNextBucketChannel()
+
+	// Return curr1 stream, rest won't be read due to an error
+	s.mockArchive.
+		On("GetXdrStreamForHash", <-nextBucket).
+		Return(curr1, nil).Once()
+
+	// BucketExists will be called only once in this test due to an error
+	s.mockBucketExistsCall.Once()
+
+	// Init entry without meta
+	_, err := s.reader.Read()
+	s.Require().NotNil(err)
+	s.Assert().Equal("Error while reading from buckets: Read INITENTRY from version <11 bucket: 0@517bea4c6627a688a8ce501febd8c562e737e3d86b29689d9956217640f3c74b", err.Error())
+}
+
+func metaEntry(version uint32) xdr.BucketEntry {
+	return xdr.BucketEntry{
+		Type: xdr.BucketEntryTypeMetaentry,
+		MetaEntry: &xdr.BucketMetadata{
+			LedgerVersion: xdr.Uint32(version),
+		},
+	}
+}
+
+func entryAccount(t xdr.BucketEntryType, id string, balance uint32) xdr.BucketEntry {
+	switch t {
+	case xdr.BucketEntryTypeLiveentry, xdr.BucketEntryTypeInitentry:
+		return xdr.BucketEntry{
+			Type: t,
+			LiveEntry: &xdr.LedgerEntry{
+				Data: xdr.LedgerEntryData{
+					Type: xdr.LedgerEntryTypeAccount,
+					Account: &xdr.AccountEntry{
+						AccountId: xdr.MustAddress(id),
+						Balance:   xdr.Int64(balance),
+					},
+				},
+			},
+		}
+	case xdr.BucketEntryTypeDeadentry:
+		return xdr.BucketEntry{
+			Type: xdr.BucketEntryTypeDeadentry,
+			DeadEntry: &xdr.LedgerKey{
+				Type:    xdr.LedgerEntryTypeAccount,
+				Account: &xdr.LedgerKeyAccount{xdr.MustAddress(id)},
+			},
+		}
+	default:
+		panic("Unkown entry type")
+	}
+
 }
 
 func createXdrStream(entries ...xdr.BucketEntry) *historyarchive.XdrStream {
@@ -155,7 +298,7 @@ func createXdrStream(entries ...xdr.BucketEntry) *historyarchive.XdrStream {
 // getNextBucket is a helper that returns next bucket hash in the order of processing.
 // This allows to write simpler test code that ensures that mocked calls are in a
 // correct order.
-func (s *MemoryStateReaderTestSuite) getNextBucket() <-chan (historyarchive.Hash) {
+func (s *MemoryStateReaderTestSuite) getNextBucketChannel() <-chan (historyarchive.Hash) {
 	// 11 levels with 2 buckets each = buffer of 22
 	c := make(chan (historyarchive.Hash), 22)
 
